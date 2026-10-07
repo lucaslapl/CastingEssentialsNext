@@ -476,11 +476,9 @@ bool PlayerAliases::ExtractJSONString(const std::string& json, const std::string
 
 std::string PlayerAliases::GetETF2LCachePath() const
 {
-    char gameDir[MAX_PATH];
+    const char* gameDir = "tf";
     if (Interfaces::GetEngineClient())
-        Interfaces::GetEngineClient()->GetGameDir(gameDir, sizeof(gameDir));
-    else
-        V_strcpy_safe(gameDir, "tf");
+        gameDir = Interfaces::GetEngineClient()->GetGameDirectory();
 
     return std::string(gameDir) + "/cfg/ce_playeraliases_etf2l_cache.cfg";
 }
