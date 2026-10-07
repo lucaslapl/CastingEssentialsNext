@@ -44,7 +44,7 @@ private:
     void QueueETF2LFetch(uint64 steamID64);
     void ETF2LWorker();
     static bool FetchETF2LName(uint64 steamID64, std::string& name);
-    static bool ExtractJSONString(const std::string& json, const std::string& key, std::string& out);
+    static bool ExtractETF2LPlayerName(const std::string& json, std::string& out);
     std::string GetETF2LCachePath() const;
     void LoadETF2LCache();
     void SaveETF2LCache();

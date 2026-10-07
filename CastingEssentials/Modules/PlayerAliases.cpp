@@ -432,46 +432,152 @@ bool PlayerAliases::FetchETF2LName(uint64 steamID64, std::string& name)
     if (!received)
         return false;
 
-    return ExtractJSONString(response, "name", name);
+    return ExtractETF2LPlayerName(response, name);
 }
 
-bool PlayerAliases::ExtractJSONString(const std::string& json, const std::string& key, std::string& out)
+// Returns the position just past the closing quote of the JSON string starting at pos,
+// or npos if the string is unterminated.
+static size_t SkipJSONString(const std::string& json, size_t pos)
 {
-    const std::string needle = "\"" + key + "\"";
-    size_t pos = json.find(needle);
+    pos++;
+    while (pos < json.length())
+    {
+        if (json[pos] == '\\')
+            pos += 2;
+        else if (json[pos] == '"')
+            return pos + 1;
+        else
+            pos++;
+    }
+    return std::string::npos;
+}
+
+// Returns the position just past the JSON value (string, object, array or literal)
+// starting at pos, or npos if the JSON is malformed.
+static size_t SkipJSONValue(const std::string& json, size_t pos)
+{
+    if (pos >= json.length())
+        return std::string::npos;
+
+    if (json[pos] == '"')
+        return SkipJSONString(json, pos);
+
+    int depth = 0;
+    while (pos < json.length())
+    {
+        const char c = json[pos];
+        if (c == '"')
+        {
+            pos = SkipJSONString(json, pos);
+            if (pos == std::string::npos)
+                return std::string::npos;
+            if (depth == 0)
+                return pos;
+            continue;
+        }
+
+        if (c == '{' || c == '[')
+            depth++;
+        else if (c == '}' || c == ']')
+        {
+            if (depth == 0)
+                return pos;
+            if (--depth == 0)
+                return pos + 1;
+        }
+        else if (depth == 0 && c == ',')
+            return pos;
+        pos++;
+    }
+    return std::string::npos;
+}
+
+bool PlayerAliases::ExtractETF2LPlayerName(const std::string& json, std::string& out)
+{
+    // The ETF2L API serializes the members of the "player" object in an unstable order,
+    // and the nested "teams" data has "name" keys of its own, so the player name has to
+    // be looked up as a direct member of "player" instead of grabbing the first "name"
+    // match anywhere in the response.
+    size_t pos = json.find("\"player\"");
     if (pos == std::string::npos)
-        return false;
-    pos = json.find(':', pos + needle.length());
-    if (pos == std::string::npos)
-        return false;
-    pos = json.find('"', pos);
-    if (pos == std::string::npos)
-        return false;
-    const size_t start = pos + 1;
-    const size_t end = json.find('"', start);
-    if (end == std::string::npos)
         return false;
 
-    out.clear();
-    for (size_t i = start; i < end; i++)
+    pos = json.find('{', pos);
+    if (pos == std::string::npos)
+        return false;
+
+    pos++;
+    while (pos < json.length())
     {
-        if (json[i] == '\\' && i + 1 < end)
+        // Skip the whitespace and separators between members.
+        while (pos < json.length() &&
+               (json[pos] == ' ' || json[pos] == ',' || json[pos] == '\t' || json[pos] == '\r' || json[pos] == '\n'))
+            pos++;
+
+        if (pos >= json.length() || json[pos] == '}')
+            return false;
+
+        if (json[pos] != '"')
+            return false;
+
+        const size_t keyStart = pos + 1;
+        pos = SkipJSONString(json, pos);
+        if (pos == std::string::npos)
+            return false;
+        const std::string key = json.substr(keyStart, pos - keyStart - 1);
+
+        while (pos < json.length() &&
+               (json[pos] == ' ' || json[pos] == '\t' || json[pos] == '\r' || json[pos] == '\n'))
+            pos++;
+        if (pos >= json.length() || json[pos] != ':')
+            return false;
+        pos++;
+
+        while (pos < json.length() &&
+               (json[pos] == ' ' || json[pos] == '\t' || json[pos] == '\r' || json[pos] == '\n'))
+            pos++;
+        if (pos >= json.length())
+            return false;
+
+        if (key == "name")
         {
-            i++;
-            switch (json[i])
+            if (json[pos] != '"')
+                return false;
+
+            const size_t start = pos + 1;
+            pos = SkipJSONString(json, pos);
+            if (pos == std::string::npos)
+                return false;
+            const size_t end = pos - 1;
+
+            out.clear();
+            for (size_t i = start; i < end; i++)
             {
-                case 'n': out.push_back('\n'); break;
-                case 't': out.push_back('\t'); break;
-                case 'r': out.push_back('\r'); break;
-                case 'b': out.push_back('\b'); break;
-                case 'f': out.push_back('\f'); break;
-                default:  out.push_back(json[i]); break;
+                if (json[i] == '\\' && i + 1 < end)
+                {
+                    i++;
+                    switch (json[i])
+                    {
+                        case 'n': out.push_back('\n'); break;
+                        case 't': out.push_back('\t'); break;
+                        case 'r': out.push_back('\r'); break;
+                        case 'b': out.push_back('\b'); break;
+                        case 'f': out.push_back('\f'); break;
+                        default:  out.push_back(json[i]); break;
+                    }
+                }
+                else
+                    out.push_back(json[i]);
             }
+            return !out.empty();
         }
-        else
-            out.push_back(json[i]);
+
+        pos = SkipJSONValue(json, pos);
+        if (pos == std::string::npos)
+            return false;
     }
-    return !out.empty();
+
+    return false;
 }
 
 std::string PlayerAliases::GetETF2LCachePath() const
