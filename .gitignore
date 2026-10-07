@@ -38,6 +38,7 @@
 /Release/
 /Debug/
 CastingEssentials/build
+/build/
 CastingEssentials/Release/
 CastingEssentials/Debug/
 *.exp
