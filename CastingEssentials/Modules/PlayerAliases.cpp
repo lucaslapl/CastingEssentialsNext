@@ -3,9 +3,17 @@
 #include "PluginBase/Player.h"
 #include "PluginBase/TFDefinitions.h"
 #include <cdll_int.h>
+#include <cstdio>
+#include <cstdlib>
+#include <fstream>
 #include <steam/steam_api.h>
 #include <toolframework/ienginetool.h>
 #include <vprof.h>
+
+#include <Windows.h>
+#include <winhttp.h>
+
+#pragma comment(lib, "winhttp.lib")
 
 MODULE_REGISTER(PlayerAliases);
 
@@ -32,9 +40,31 @@ PlayerAliases::PlayerAliases()
           "ce_playeraliases_remove", [](const CCommand& args) { GetModule()->RemovePlayerAlias(args); },
           "Removes an existing player alias."),
 
+      ce_playeraliases_etf2l(
+          "ce_playeraliases_etf2l", "0", FCVAR_NONE,
+          "If 1, automatically fetches ETF2L names and uses them as aliases.",
+          [](IConVar* var, const char*, float) { GetModule()->ToggleETF2L(static_cast<ConVar*>(var)); }),
+      ce_playeraliases_etf2l_refresh(
+          "ce_playeraliases_etf2l_refresh", []() { GetModule()->ETF2LRefresh(); },
+          "Re-fetches ETF2L names for all connected players."),
+      ce_playeraliases_etf2l_reset(
+          "ce_playeraliases_etf2l_reset", []() { GetModule()->ETF2LReset(); },
+          "Clears the on-disk ETF2L name cache."),
       m_GetPlayerInfoHook(
           std::bind(&PlayerAliases::GetPlayerInfoOverride, this, std::placeholders::_1, std::placeholders::_2))
 {
+    LoadETF2LCache();
+}
+
+PlayerAliases::~PlayerAliases()
+{
+    {
+        std::lock_guard<std::mutex> lock(m_ETF2LQueueMutex);
+        m_ETF2LShutdown = true;
+    }
+    m_ETF2LQueueCV.notify_all();
+    if (m_ETF2LThread.joinable())
+        m_ETF2LThread.join();
 }
 
 bool PlayerAliases::CheckDependencies()
@@ -93,6 +123,13 @@ bool PlayerAliases::GetPlayerInfoOverride(int ent_num, player_info_s* pinfo)
     bool result = m_GetPlayerInfoHook.GetOriginal()(ent_num, pinfo);
 
     CSteamID playerSteamID(pinfo->friendsID, 1, universe, k_EAccountTypeIndividual);
+
+    if (ce_playeraliases_etf2l.GetBool() && playerSteamID.IsValid())
+    {
+        DrainETF2LResults();
+        QueueETF2LFetch(playerSteamID.ConvertToUint64());
+    }
+
     const char* alias = GetAlias(playerSteamID);
 
     if (auto mode = ce_playeraliases_format_mode.GetInt(); mode == 0 || (mode == 1 && alias))
@@ -239,3 +276,272 @@ void PlayerAliases::FindAndReplaceInString(std::string& str, const std::string_v
 }
 
 void PlayerAliases::ToggleEnabled(const ConVar* var) { m_GetPlayerInfoHook.SetEnabled(var->GetBool()); }
+static constexpr int kETF2LMaxFetchAttempts = 3;
+
+void PlayerAliases::QueueETF2LFetch(uint64 steamID64)
+{
+    const auto state = m_ETF2LFetchStates.find(steamID64);
+    if (state != m_ETF2LFetchStates.end())
+    {
+        // Only failed fetches are re-queued, up to a limited number of attempts.
+        if (state->second != FetchState::Failed)
+            return;
+        if (m_ETF2LFetchAttempts[steamID64] >= kETF2LMaxFetchAttempts)
+            return;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(m_ETF2LCacheMutex);
+        auto cached = m_ETF2LCache.find(steamID64);
+        if (cached != m_ETF2LCache.end())
+        {
+            m_CustomAliases[CSteamID(steamID64)] = cached->second;
+            m_ETF2LFetchStates[steamID64] = FetchState::Fetched;
+            return;
+        }
+    }
+
+    m_ETF2LFetchStates[steamID64] = FetchState::Pending;
+
+    {
+        std::lock_guard<std::mutex> lock(m_ETF2LQueueMutex);
+        m_ETF2LQueue.push_back(steamID64);
+    }
+    m_ETF2LQueueCV.notify_one();
+
+    if (!m_ETF2LThreadRunning.exchange(true))
+        m_ETF2LThread = std::thread(&PlayerAliases::ETF2LWorker, this);
+}
+
+void PlayerAliases::ETF2LWorker()
+{
+    while (true)
+    {
+        uint64 steamID64;
+        {
+            std::unique_lock<std::mutex> lock(m_ETF2LQueueMutex);
+            m_ETF2LQueueCV.wait(lock, [this]() { return m_ETF2LShutdown || !m_ETF2LQueue.empty(); });
+            if (m_ETF2LShutdown && m_ETF2LQueue.empty())
+                break;
+            steamID64 = m_ETF2LQueue.front();
+            m_ETF2LQueue.pop_front();
+        }
+
+        std::string name;
+        if (!FetchETF2LName(steamID64, name))
+        {
+            std::lock_guard<std::mutex> lock(m_ETF2LResultMutex);
+            m_ETF2LFailedFetches.push_back(steamID64);
+            continue;
+        }
+
+        std::lock_guard<std::mutex> lock(m_ETF2LResultMutex);
+        m_ETF2LResults[CSteamID(steamID64)] = name;
+    }
+}
+
+void PlayerAliases::DrainETF2LResults()
+{
+    std::map<CSteamID, std::string> results;
+    std::deque<uint64> failures;
+    {
+        std::lock_guard<std::mutex> lock(m_ETF2LResultMutex);
+        results.swap(m_ETF2LResults);
+        failures.swap(m_ETF2LFailedFetches);
+    }
+    if (results.empty() && failures.empty())
+        return;
+
+    bool dirty = false;
+    for (const auto& result : results)
+    {
+        const uint64 steamID64 = result.first.ConvertToUint64();
+        m_CustomAliases[result.first] = result.second;
+        m_ETF2LFetchStates[steamID64] = FetchState::Fetched;
+        {
+            std::lock_guard<std::mutex> lock(m_ETF2LCacheMutex);
+            m_ETF2LCache[steamID64] = result.second;
+        }
+        dirty = true;
+    }
+    for (uint64 steamID64 : failures)
+    {
+        m_ETF2LFetchAttempts[steamID64]++;
+        m_ETF2LFetchStates[steamID64] = FetchState::Failed;
+    }
+    if (dirty)
+        SaveETF2LCache();
+}
+
+bool PlayerAliases::FetchETF2LName(uint64 steamID64, std::string& name)
+{
+    const wchar_t kHostname[] = L"api.etf2l.org";
+    const wchar_t kUserAgent[] = L"CastingEssentialsNext (github.com/drunderscore/CastingEssentialsNext)";
+
+    HINTERNET session = WinHttpOpen(
+        kUserAgent, WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+        WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!session)
+        return false;
+
+    // Bound each request so a hanging server can't block shutdown in ~PlayerAliases().
+    WinHttpSetTimeouts(session, 5000, 5000, 5000, 5000);
+
+    HINTERNET connect = WinHttpConnect(session, kHostname, INTERNET_DEFAULT_HTTPS_PORT, 0);
+    if (!connect)
+    {
+        WinHttpCloseHandle(session);
+        return false;
+    }
+
+    const std::string path = std::string("/player/") + std::to_string(steamID64) + ".json";
+    std::wstring widePath(path.begin(), path.end());
+
+    HINTERNET request = WinHttpOpenRequest(
+        connect, L"GET", widePath.c_str(), nullptr, WINHTTP_NO_REFERER,
+        WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
+    if (!request)
+    {
+        WinHttpCloseHandle(connect);
+        WinHttpCloseHandle(session);
+        return false;
+    }
+
+    const BOOL sent = WinHttpSendRequest(
+        request, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0);
+    BOOL received = FALSE;
+    std::string response;
+    if (sent && WinHttpReceiveResponse(request, nullptr))
+    {
+        DWORD bytesRead = 0;
+        char buffer[4096];
+        do
+        {
+            bytesRead = 0;
+            if (!WinHttpReadData(request, buffer, sizeof(buffer), &bytesRead) || bytesRead == 0)
+                break;
+            response.append(buffer, bytesRead);
+        } while (bytesRead > 0);
+        received = !response.empty();
+    }
+
+    WinHttpCloseHandle(request);
+    WinHttpCloseHandle(connect);
+    WinHttpCloseHandle(session);
+
+    if (!received)
+        return false;
+
+    return ExtractJSONString(response, "name", name);
+}
+
+bool PlayerAliases::ExtractJSONString(const std::string& json, const std::string& key, std::string& out)
+{
+    const std::string needle = "\"" + key + "\"";
+    size_t pos = json.find(needle);
+    if (pos == std::string::npos)
+        return false;
+    pos = json.find(':', pos + needle.length());
+    if (pos == std::string::npos)
+        return false;
+    pos = json.find('"', pos);
+    if (pos == std::string::npos)
+        return false;
+    const size_t start = pos + 1;
+    const size_t end = json.find('"', start);
+    if (end == std::string::npos)
+        return false;
+
+    out.clear();
+    for (size_t i = start; i < end; i++)
+    {
+        if (json[i] == '\\' && i + 1 < end)
+        {
+            i++;
+            switch (json[i])
+            {
+                case 'n': out.push_back('\n'); break;
+                case 't': out.push_back('\t'); break;
+                case 'r': out.push_back('\r'); break;
+                case 'b': out.push_back('\b'); break;
+                case 'f': out.push_back('\f'); break;
+                default:  out.push_back(json[i]); break;
+            }
+        }
+        else
+            out.push_back(json[i]);
+    }
+    return !out.empty();
+}
+
+std::string PlayerAliases::GetETF2LCachePath() const
+{
+    char gameDir[MAX_PATH];
+    if (Interfaces::GetEngineClient())
+        Interfaces::GetEngineClient()->GetGameDir(gameDir, sizeof(gameDir));
+    else
+        V_strcpy_safe(gameDir, "tf");
+
+    return std::string(gameDir) + "/cfg/ce_playeraliases_etf2l_cache.cfg";
+}
+
+void PlayerAliases::LoadETF2LCache()
+{
+    const std::string path = GetETF2LCachePath();
+    std::ifstream file(path);
+    if (!file.is_open())
+        return;
+
+    std::lock_guard<std::mutex> lock(m_ETF2LCacheMutex);
+    std::string line;
+    while (std::getline(file, line))
+    {
+        const size_t space = line.find(' ');
+        if (space == std::string::npos)
+            continue;
+        const uint64 steamID64 = std::strtoull(line.substr(0, space).c_str(), nullptr, 10);
+        if (!steamID64)
+            continue;
+        m_ETF2LCache[steamID64] = line.substr(space + 1);
+    }
+}
+
+void PlayerAliases::SaveETF2LCache()
+{
+    std::lock_guard<std::mutex> lock(m_ETF2LCacheMutex);
+    std::ofstream file(GetETF2LCachePath(), std::ios::trunc);
+    if (!file.is_open())
+        return;
+    for (const auto& entry : m_ETF2LCache)
+        file << entry.first << ' ' << entry.second << '\n';
+}
+
+void PlayerAliases::ToggleETF2L(const ConVar* var)
+{
+    if (var->GetBool())
+        LoadETF2LCache();
+}
+
+void PlayerAliases::ETF2LRefresh()
+{
+    m_ETF2LFetchStates.clear();
+    m_ETF2LFetchAttempts.clear();
+    {
+        std::lock_guard<std::mutex> lock(m_ETF2LCacheMutex);
+        m_ETF2LCache.clear();
+    }
+    Msg("ETF2L fetch states cleared. Reconnect or wait for the next GetPlayerInfo calls to re-fetch.\n");
+}
+
+void PlayerAliases::ETF2LReset()
+{
+    {
+        std::lock_guard<std::mutex> lock(m_ETF2LCacheMutex);
+        m_ETF2LCache.clear();
+    }
+    m_ETF2LFetchStates.clear();
+    m_ETF2LFetchAttempts.clear();
+    const std::string path = GetETF2LCachePath();
+    std::remove(path.c_str());
+    Msg("ETF2L cache cleared.\n");
+}
